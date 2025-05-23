@@ -2,18 +2,9 @@ import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.io as sio
+import warnings
+warnings.filterwarnings("ignore")
 
-cv_len = 160000
-
-def get_cv_test(train):
-    test = train.filter(pl.col("user_id") > cv_len)  # 本地验证集
-    test_label = (test.sort(["user_id", "click_timestamp"], descending=[True, True]).group_by("user_id").agg(pl.all().first()))
-    test_label = test_label["user_id", "click_article_id"]
-    test_label = test_label.rename({"click_article_id": "label"})
-    test = (test.sort(["user_id", "click_timestamp"], descending=[False, True]).with_columns([pl.col("user_id").cum_count(reverse=False).over("user_id").alias("rank")]))
-    test = test.filter(pl.col("rank") > 1)
-    test = test["user_id", "click_article_id","click_timestamp"]
-    return test, test_label
 
 def get_testa():
     test = pl.read_csv("../../dataset/testA_click_log.csv")
@@ -21,21 +12,28 @@ def get_testa():
     test = test["user_id", "click_article_id", "click_timestamp"]
     return test
 
+def get_train():
+    train = pl.read_csv("../../dataset/train_click_log.csv")
+    test = train
+    test_label = (test.sort(["user_id", "click_timestamp"], descending=[True, True]).group_by("user_id").agg(pl.all().first()))
+    test_label = test_label["user_id", "click_article_id"]
+    test_label = test_label.rename({"click_article_id": "label"})
+    test = (test.sort(["user_id", "click_timestamp"], descending=[False, True]).with_columns([pl.col("user_id").cum_count(reverse=False).over("user_id").alias("rank")]))
+    test = test.filter(pl.col("rank") > 1).drop('rank')
+    return test, test_label
+
 def itemcf(submit=0):
     art_info = pl.read_csv("../../dataset/articles.csv")
     art_info = art_info.with_columns(pl.col("article_id").alias("click_article_id")).drop("article_id")
-    train = pl.read_csv("../../dataset/train_click_log.csv")
+    train, _ = get_train()
     train = train.join(art_info, on="click_article_id", how="left")
     if submit == 0:
-        test, test_label = get_cv_test(train)
-        train = train.filter(pl.col("user_id") <= cv_len)
+        test, test_label = get_train()
     else:
         test = get_testa()
 
     train = train.with_columns(pl.count("click_article_id").over("user_id").alias("user_click_count"))                    # 统计每个用户的点击数
     train = train.with_columns((1.0 / 2**((pl.col("click_timestamp") - pl.col("created_at_ts") + 1)/(3600*1000*24*5)).abs()).alias("timedis"))
-    # train = train.with_columns(((-(pl.col("click_timestamp") - pl.col("created_at_ts"))/(3600*1000*24*4)).exp()).alias("timedis"))
-
     train_tmp = train.unique(subset=["user_id", "click_article_id"])
     article_counts = train_tmp["click_article_id"].value_counts()                                                         # 每个文章的总惦记数目，反映热门程度
     joined = train.join(train, on="user_id")                                                                              # 自己合并自己，形成商品-商品对
@@ -47,7 +45,6 @@ def itemcf(submit=0):
     result = result.with_columns((1.0 / 2**((pl.col("click_timestamp") - pl.col("click_timestamp_right") + 1)/(3600*1000)).abs()).alias("trend")) # 两篇文章的相隔时间，以小时数的指数递减
     result = result.with_columns(((pl.col("category_id") == pl.col("category_id_right")).cast(float)*0.5+1).alias("type_weight"))
     result = result.with_columns((1.0 / 2**((pl.col("words_count") - pl.col("words_count_right") + 1)/(500)).abs()).alias("words"))
-
     result = result.with_columns((1.0 / (pl.col("user_click_count") + 1).log()).alias("iif"))                             # 用户点击数目对数倒数，一个人假如点击次数太多，那权重应该相应降低
     result = result.with_columns((1.0 / (pl.col("user_click_count") + 1)**0.3).alias("iif2"))                             # 更合理的方式
     result = result.with_columns((1.0 / pl.col("coef") * pl.col("iif2") / pl.col("type_weight") * pl.col("timedis") * pl.col("timedis_right") * pl.col("words")).alias("weight"))                                  # 合并权重  * pl.col("trend")
@@ -60,8 +57,6 @@ def itemcf(submit=0):
         cv_test(result, test, test_label)
     else:
         cv_test(result, test)
-
-
 
 def cv_test(result, test_sel, test_label = None):
     test = test_sel
@@ -103,11 +98,6 @@ def cv_test(result, test_sel, test_label = None):
     print(itemcf_out)
 
     if isinstance(test_label, pl.DataFrame):
-        # art_info = art_info.with_columns(pl.col("click_article_id_right").alias("label")).drop("click_article_id_right")
-        # tmp = test_label.join(art_info, on="label", how="left")
-        # tmp = tmp.join(last_time, on="user_id", how="left")
-        # tmp = tmp.with_columns(((pl.col("click_timestamp") - pl.col("created_at_ts")) / (1000 * 60 * 60)).alias("dt"))
-        # print(tmp)
         df = test_label.join(itemcf_out, on="user_id")
         df = df.with_columns((pl.col("label") == pl.col("click_article_id_right")).alias("is_correct"))                       # 判断预测的和真实的是否一致
         df = df.group_by("user_id").agg(pl.any("is_correct").alias("true"))                                                   # 按用户分组，只有有一个匹配上就算预测成功
@@ -129,4 +119,4 @@ def cv_test(result, test_sel, test_label = None):
 
         print(df_final)
 
-itemcf(submit=1)
+itemcf(submit=0)
